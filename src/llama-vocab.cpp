@@ -271,9 +271,9 @@ struct llm_bigram_bpe {
     using queue = llama_priority_queue<llm_bigram_bpe, queue_storage, comparator>;
     llm_symbol::index left;
     llm_symbol::index right;
-    std::string text;
+    size_t left_n;
+    size_t right_n;
     int rank;
-    size_t size;
 };
 
 struct llm_tokenizer_bpe : llm_tokenizer {
@@ -611,9 +611,7 @@ struct llm_tokenizer_bpe_session {
                 if (left_symbol.n == 0 || right_symbol.n == 0) {
                     continue;
                 }
-                std::string left_token = std::string(left_symbol.text, left_symbol.n);
-                std::string right_token = std::string(right_symbol.text, right_symbol.n);
-                if (left_token + right_token != bigram.text) {
+                if (left_symbol.n != bigram.left_n || right_symbol.n != bigram.right_n) {
                     continue;  // Skip this bigram if it's outdated
                 }
 
@@ -677,12 +675,7 @@ private:
         if (left == -1 || right == -1) {
             return;
         }
-        std::string left_token  = std::string(symbols[left].text,  symbols[left].n);
-        std::string right_token = std::string(symbols[right].text, symbols[right].n);
-
-        int rank_found = -1;
-
-        rank_found = vocab.find_bpe_rank(left_token, right_token);
+        int rank_found = vocab.find_bpe_rank(symbols[left].text, symbols[left].n, symbols[right].text, symbols[right].n);
 
         if (rank_found < 0) {
             return;
@@ -690,11 +683,11 @@ private:
 
         llm_bigram_bpe bigram;
 
-        bigram.left  = left;
-        bigram.right = right;
-        bigram.text  = left_token + right_token;
-        bigram.size  = left_token.size() + right_token.size();
-        bigram.rank  = rank_found;
+        bigram.left    = left;
+        bigram.right   = right;
+        bigram.left_n  = symbols[left].n;
+        bigram.right_n = symbols[right].n;
+        bigram.rank    = rank_found;
 
         work_queue.push(bigram);
     }
@@ -1648,13 +1641,7 @@ struct llama_vocab::impl {
 
     std::vector<llama_token> cache_special_tokens;
     std::vector<std::string> cache_token_to_piece; // llama_token_to_piece(special = true);
-    struct pair_hash {
-        size_t operator()(const std::pair<std::string, std::string> & p) const {
-            return std::hash<std::string>{}(p.first) ^  //create some hash for pair
-                   (std::hash<std::string>{}(p.second) << 1);
-        }
-    };
-    std::unordered_map<std::pair<std::string, std::string>, int, pair_hash> bpe_ranks;
+    std::unordered_map<std::string, int> bpe_ranks;
 
     // set of all tokens that cause "end of generation"
     std::set<llama_token> special_eog_ids;
@@ -1821,7 +1808,10 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                         second = word.substr(pos + 1);
                     }
 
-                    bpe_ranks.emplace(std::make_pair(first, second), i);
+                    std::string packed = first + second;
+                    uint32_t len1 = first.size();
+                    packed.append((const char*)&len1, sizeof(len1));
+                    bpe_ranks.emplace(packed, i);
                 }
             }
 
@@ -1905,7 +1895,10 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                         second = word.substr(pos + 1);
                     }
 
-                    bpe_ranks.emplace(std::make_pair(first, second), i);
+                    std::string packed = first + second;
+                    uint32_t len1 = first.size();
+                    packed.append((const char*)&len1, sizeof(len1));
+                    bpe_ranks.emplace(packed, i);
                 }
             }
 
@@ -3726,10 +3719,17 @@ int llama_vocab::max_token_len() const {
 }
 
 int llama_vocab::find_bpe_rank(const std::string & token_left, const std::string & token_right) const {
-    GGML_ASSERT(token_left.find(' ')   == std::string::npos);
-    GGML_ASSERT(token_right.find(' ')  == std::string::npos);
+    return find_bpe_rank(token_left.data(), token_left.size(), token_right.data(), token_right.size());
+}
 
-    auto it = pimpl->bpe_ranks.find(std::make_pair(token_left, token_right));
+int llama_vocab::find_bpe_rank(const char * s1, size_t n1, const char * s2, size_t n2) const {
+    thread_local std::string search_buffer;
+    search_buffer.assign(s1, n1);
+    search_buffer.append(s2, n2);
+    uint32_t len1_magic = n1;
+    search_buffer.append((const char*)&len1_magic, sizeof(len1_magic));
+
+    auto it = pimpl->bpe_ranks.find(search_buffer);
     if (it == pimpl->bpe_ranks.end()) {
         return -1;
     }
@@ -3741,7 +3741,12 @@ std::vector<std::string> llama_vocab::get_bpe_merges() const {
     std::vector<std::string> result(pimpl->bpe_ranks.size());
 
     for (const auto & pair : pimpl->bpe_ranks) {
-        result[pair.second] = pair.first.first + " " + pair.first.second;
+        const std::string & packed = pair.first;
+        uint32_t n1;
+        memcpy(&n1, packed.data() + packed.size() - 4, 4);
+        std::string s1 = packed.substr(0, n1);
+        std::string s2 = packed.substr(n1, packed.size() - 4 - n1);
+        result[pair.second] = s1 + " " + s2;
     }
 
     return result;
